@@ -141,3 +141,85 @@ uvx --from . linuxdo-mcp        # 或 uv run src/linuxdo_mcp/server.py
 - 读取浏览器 cookie 依赖 [pycookiecheat](https://github.com/n8henrie/pycookiecheat),只读取 linux.do 一个域名下的 cookie。
 - 偶发被 Cloudflare 拦截时会自动重试 3 次;仍失败可设 `LINUXDO_IMPERSONATE=chrome131`(或 `chrome124`)换指纹。
 - 所有请求为只读 GET,不做任何写操作。
+
+## 远程模式：Streamable HTTP + OAuth(供 ChatGPT 连接)
+
+本机 stdio 模式完全不变。远程模式额外提供一个带 OAuth 2.1 鉴权的 Streamable HTTP
+入口,实现写法与 [`54xzh/miot-mcp`](https://github.com/54xzh/miot-mcp) 的远程模式一致:
+单用户、ChatGPT CIMD(client_id 元数据文档)+ PKCE `S256`,密码在同意页手工输入。
+
+### 1. 生成管理员密码摘要
+
+```bash
+uv run python -m linuxdo_mcp.oauth.cli     # 安装后也可用 linuxdo-mcp-oauth-password
+```
+
+只输出 `scrypt$...` 摘要,不保存明文。密码至少 12 位。
+
+### 2. 配置并启动
+
+```bash
+export MCP_TRANSPORT="streamable-http"
+export MCP_PUBLIC_URL="https://<你的域名>/mcp"
+export MCP_OAUTH_PASSWORD_HASH='scrypt$...'
+export MCP_HTTP_HOST="127.0.0.1"
+export MCP_HTTP_PORT="8011"
+
+uv run python -m linuxdo_mcp.server
+```
+
+- `MCP_PUBLIC_URL` 必须是 HTTPS 绝对地址且带 `/mcp` 路径(回环测试允许 `http://127.0.0.1:端口/mcp`)。
+- `MCP_HTTP_HOST` 只接受回环地址,公网入口交给 Cloudflare Tunnel。
+- 登录 cookie 仍需 `LINUXDO_COOKIE`(或缓存),远程模式只是把它包在 OAuth 后面。
+
+### 3. Cloudflare Tunnel
+
+只把域名转发到回环端口,**不要**给这个域名启用 Cloudflare Access,否则会挡住
+ChatGPT 的 OAuth 自动发现。
+
+```yaml
+ingress:
+  - hostname: <你的域名>
+    service: http://127.0.0.1:8011
+  - service: http_status:404
+```
+
+### 4. ChatGPT 接入
+
+新建连接 → 服务器 URL 填 `https://<你的域名>/mcp` → 身份验证选 OAuth →
+在跳出的同意页输入用户名 `admin` 和第 1 步设置的密码。
+
+### 远程模式的安全边界
+
+- 工具集与本机完全一致(13 个只读工具),没有登录管理类入口。
+- `/token` 必须带与 `MCP_PUBLIC_URL` 完全一致的 `resource` 参数,否则 `invalid_target`。
+- 授权页带 CSRF 令牌,同一来源 15 分钟内 10 次失败即拒绝。
+- 刷新令牌轮换,重放旧的 refresh token 会作废整条 token family。
+- `/revoke` 支持公共客户端(token + client_id,不需要 client_secret)。
+- 授权/令牌/撤销端点按 Cloudflare 来源 IP 限流(60 秒 12 次),请求体上限 64 KiB。
+- OAuth 数据默认落在 `~/.linuxdo-mcp/oauth.db`,只保存客户端信息与各类令牌摘要。
+
+### 新增环境变量
+
+| 变量 | 说明 |
+|---|---|
+| `MCP_TRANSPORT` | `stdio`(默认)/ `streamable-http` |
+| `MCP_PUBLIC_URL` | 远程模式必填,形如 `https://域名/mcp` |
+| `MCP_OAUTH_PASSWORD_HASH` | 远程模式必填,`linuxdo-mcp-oauth-password` 生成的摘要 |
+| `MCP_OAUTH_ISSUER_URL` | 可选,默认取 `MCP_PUBLIC_URL` 的 origin |
+| `MCP_HTTP_HOST` / `MCP_HTTP_PORT` | 默认 `127.0.0.1` / `8000`,仅接受回环地址 |
+| `MCP_CONFIG_DIR` | 默认 `~/.linuxdo-mcp` |
+| `MCP_OAUTH_DATABASE` | 默认 `<MCP_CONFIG_DIR>/oauth.db` |
+| `MCP_OAUTH_ADMIN_USERNAME` | 同意页用户名,默认 `admin` |
+
+### 发现端点与测试
+
+```bash
+curl -s https://<你的域名>/.well-known/oauth-authorization-server
+curl -s https://<你的域名>/.well-known/oauth-protected-resource/mcp
+```
+
+```bash
+uv run pytest tests -q     # 22 项:发现文档、授权码+PKCE、刷新轮换、CIMD、限流等
+```
+

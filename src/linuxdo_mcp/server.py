@@ -27,6 +27,31 @@ IMPERSONATE = os.environ.get("LINUXDO_IMPERSONATE", "chrome")
 
 mcp = _Server("linuxdo")
 
+# 远程（streamable-http + OAuth）服务器要复用同一批工具函数，这里登记一份。
+_REMOTE_TOOLS = []
+
+
+def _tool():
+    """注册工具：既挂到本机 stdio 服务器，也记入远程服务器复用列表。"""
+
+    def decorator(fn):
+        mcp.tool()(fn)
+        _REMOTE_TOOLS.append(fn)
+        return fn
+
+    return decorator
+
+
+def create_remote_server(auth, token_verifier):
+    """构造带 OAuth 令牌校验的远程 MCP 服务器，暴露与本机完全相同的工具集。
+
+    远程模式只做只读检索，没有登录管理类工具，因此无需按工具名做远程裁剪。
+    """
+    server = _Server("linuxdo", auth=auth, token_verifier=token_verifier)
+    for fn in _REMOTE_TOOLS:
+        server.tool()(fn)
+    return server
+
 
 def _cookie_header():
     return cookies.get_cookie()
@@ -388,13 +413,13 @@ def _format_topic(topic_id, posts, start):
     return "\n".join(out).rstrip()
 
 
-@mcp.tool()
+@_tool()
 def whoami() -> dict:
     """查看当前 cookie 对应的 linux.do 登录用户与信任等级。"""
     return _whoami()
 
 
-@mcp.tool()
+@_tool()
 def search(query: str, page: int = 1, pages: int = 1) -> dict:
     """全量搜索 linux.do。query 支持 Discourse 高级语法（order:latest、#分类、@用户、
     tags:标签、after:2025-01-01、in:title 等）。pages 为连续抓取的页数（每页约 50 条）。
@@ -402,7 +427,7 @@ def search(query: str, page: int = 1, pages: int = 1) -> dict:
     return _search(query, page, pages)
 
 
-@mcp.tool()
+@_tool()
 def get_topic(topic_id: int | str, posts: int = 20, start: int = 1) -> dict:
     """读取指定话题的详情与楼层正文。topic_id 可传数字 id，也可直接传 linux.do 话题
     URL（如 https://linux.do/t/xxx/2885565/1，会自动取出 id）。posts=返回楼层数，
@@ -410,13 +435,13 @@ def get_topic(topic_id: int | str, posts: int = 20, start: int = 1) -> dict:
     return _topic(topic_id, posts, start)
 
 
-@mcp.tool()
+@_tool()
 def format_search(query: str, page: int = 1, pages: int = 1) -> str:
     """同 search，但直接返回拼好的 Markdown（标题+URL+摘要列表），客户端可原样展示。"""
     return _format_search(query, page, pages)
 
 
-@mcp.tool()
+@_tool()
 def format_topic(topic_id: int | str, posts: int = 20, start: int = 1) -> str:
     """同 get_topic，但直接返回拼好的 Markdown（出处头 + 逐楼表格），客户端可原样展示。
     topic_id 可传数字 id 或 linux.do 话题 URL（自动解析）。posts=楼层数，
@@ -424,14 +449,14 @@ def format_topic(topic_id: int | str, posts: int = 20, start: int = 1) -> str:
     return _format_topic(topic_id, posts, start)
 
 
-@mcp.tool()
+@_tool()
 def list_categories() -> dict:
     """列出所有板块/类别，含每个类别的话题数(topic_count)与帖子数(post_count)。"""
     cats = _categories()
     return {"count": len(cats), "categories": cats}
 
 
-@mcp.tool()
+@_tool()
 def category_topics(category_id: int, page: int = 1) -> dict:
     """列出指定类别下的话题（每页约 30 条）。返回含该类别总话题数 topic_count、
     本页话题列表与是否有下一页。category_id 用 list_categories 查询。每条话题已含
@@ -440,14 +465,14 @@ def category_topics(category_id: int, page: int = 1) -> dict:
     return _category_topics(category_id, page)
 
 
-@mcp.tool()
+@_tool()
 def list_tags() -> dict:
     """列出所有标签及各自的话题数(count)。"""
     tags = _tags()
     return {"count": len(tags), "tags": tags}
 
 
-@mcp.tool()
+@_tool()
 def tag_topics(tag: str, page: int = 1) -> dict:
     """列出指定标签下的话题（每页约 30 条）。tag 用标签名（如「人工智能」）。每条话题
     已含 category、min_trust_level。展示约定同 latest_topics（Markdown 表格、完整
@@ -455,13 +480,13 @@ def tag_topics(tag: str, page: int = 1) -> dict:
     return _tag_topics(tag, page)
 
 
-@mcp.tool()
+@_tool()
 def user_info(username: str) -> dict:
     """查询用户资料：信任等级、注册/最后在线时间、发帖数、获赞数等。"""
     return _user_info(username)
 
 
-@mcp.tool()
+@_tool()
 def latest_topics(page: int = 1) -> dict:
     """获取首页「最新」话题列表（每页约 30 条）。每条已含 category(分类名)、
     min_trust_level(最低等级要求，null=无限制)，无需再逐条 get_topic 查分类。
@@ -472,7 +497,7 @@ def latest_topics(page: int = 1) -> dict:
     return _topics_page(f"/latest.json?page={page}", {"page": page})
 
 
-@mcp.tool()
+@_tool()
 def top_topics(period: str = "weekly", page: int = 1) -> dict:
     """获取「热门」话题列表。period 取 daily/weekly/monthly/quarterly/yearly/all。
     每条已含 category、min_trust_level。展示约定同 latest_topics（Markdown 表格、
@@ -480,14 +505,52 @@ def top_topics(period: str = "weekly", page: int = 1) -> dict:
     return _top(period, page)
 
 
-@mcp.tool()
+@_tool()
 def user_actions(username: str, limit: int = 20) -> dict:
     """获取某用户的发帖/回复活动（含摘要与跳转链接）。"""
     return _user_actions(username, limit)
 
 
 def main():
-    mcp.run()
+    transport = os.environ.get("MCP_TRANSPORT", "stdio").strip().lower()
+    if transport == "stdio":
+        mcp.run()
+        return
+    if transport != "streamable-http":
+        raise SystemExit("MCP_TRANSPORT must be either stdio or streamable-http")
+
+    import uvicorn
+    from mcp.server.auth.settings import AuthSettings
+
+    from .oauth import (
+        OAuthStore,
+        SingleUserOAuthProvider,
+        StoreTokenVerifier,
+        build_remote_app,
+    )
+    from .oauth_config import load_oauth_config
+
+    oauth_config = load_oauth_config()
+    oauth_store = OAuthStore(oauth_config.database_path)
+    oauth_provider = SingleUserOAuthProvider(oauth_config, oauth_store)
+    token_verifier = StoreTokenVerifier(oauth_provider)
+    auth = AuthSettings(
+        issuer_url=oauth_config.issuer_url,
+        resource_server_url=oauth_config.public_url,
+        required_scopes=list(oauth_config.scopes),
+        # audience（resource）校验由 StoreTokenVerifier / provider 自己做，
+        # 这里显式关掉 MCP SDK 的重复校验，避免 3.0 默认开启后行为变化。
+        validate_token_resource=False,
+    )
+    remote_mcp = create_remote_server(auth, token_verifier)
+    app = build_remote_app(oauth_config, remote_mcp, oauth_provider, auth)
+    uvicorn.run(
+        app,
+        host=oauth_config.bind_host,
+        port=oauth_config.bind_port,
+        proxy_headers=True,
+        forwarded_allow_ips="127.0.0.1",
+    )
 
 
 if __name__ == "__main__":
