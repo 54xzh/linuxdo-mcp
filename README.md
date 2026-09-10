@@ -211,6 +211,64 @@ ingress:
 | `MCP_CONFIG_DIR` | 默认 `~/.linuxdo-mcp` |
 | `MCP_OAUTH_DATABASE` | 默认 `<MCP_CONFIG_DIR>/oauth.db` |
 | `MCP_OAUTH_ADMIN_USERNAME` | 同意页用户名,默认 `admin` |
+| `LINUXDO_PROXY` | 可选,备用出口(如 `socks5h://127.0.0.1:25344`),见下节 |
+
+## 出口与 Cloudflare 限流
+
+linux.do 在 Cloudflare 后面,短时间密集请求就会吃到 `429 / Just a moment...`。实测要点:
+
+- 限流与挑战是**按来源 IP 分桶**的。换出口能立刻拿到一个新额度。
+- 挑战页需要执行 JS 才能通过,curl_cffi 做不到——被挑战时只能等该 IP 的惩罚窗口衰减,
+  期间继续重试会把窗口续上,所以"停手几分钟"才会恢复。
+- 设了 `LINUXDO_PROXY` 后:`_fetch` 先走直连,一旦遇到 429 或挑战页就自动切到备用出口,
+  并在 `PROXY_COOLDOWN`(180s)内都走它;冷却结束自动回切直连尝试。
+- 备用出口自己也被拦时直接报错,不会在两条出口之间来回横跳。
+
+备用出口实测对比(同一台机器):
+
+| 出口 | 表现 |
+|---|---|
+| 直连(云主机专用 IP) | 连续 4~7 个请求后开始 429,几分钟后恢复 |
+| WARP 共享出口 | 一上来就频繁被挑战,额度极小 |
+
+所以 WARP 只适合当**应急容量**,不能当主出口;真正管用的是把请求间隔留够
+(`PAGE_DELAY`,连续翻页之间 1.5s)。
+
+### 用 WARP 做备用出口(用户态,不动系统路由)
+
+不需要 root,不建 tun,不影响机器上其它服务:
+
+```bash
+mkdir -p ~/warp && cd ~/warp
+curl -sL -o wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.32/wgcf_2.2.32_linux_arm64
+curl -sL -o wireproxy.tar.gz https://github.com/windtf/wireproxy/releases/download/v1.1.3/wireproxy_linux_arm64.tar.gz
+tar xzf wireproxy.tar.gz && chmod +x wgcf wireproxy
+./wgcf register --accept-tos     # 数据中心 IP 可能瞬时 429,重试即可
+./wgcf generate                  # 生成 wgcf-profile.conf
+```
+
+把 `wgcf-profile.conf` 里的 PrivateKey / Address(v4) / PublicKey / Endpoint 填进
+`wireproxy.conf`:
+
+```ini
+[Interface]
+PrivateKey = ...
+Address = 172.16.0.2/32
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = ...
+Endpoint = engage.cloudflareclient.com:2408
+AllowedIPs = 0.0.0.0/0
+
+[Socks5]
+BindAddress = 127.0.0.1:25344
+```
+
+起服务(`~/.config/systemd/user/wireproxy.service`,`systemctl --user enable --now wireproxy`),
+再把 `LINUXDO_PROXY=socks5h://127.0.0.1:25344` 写进 MCP 服务的环境文件。
+注意:同一个 `_t` 在两条出口之间切换不会导致会话失效(已实测 whoami 交替可用),
+但仍应把备用出口当低频应急通道,不要用它跑批量抓取。
 
 ### 发现端点与测试
 

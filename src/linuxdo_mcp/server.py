@@ -10,6 +10,7 @@ import html
 import json
 import os
 import re
+import sys
 import time
 import urllib.parse
 
@@ -26,6 +27,61 @@ BASE = "https://linux.do"
 IMPERSONATE = os.environ.get("LINUXDO_IMPERSONATE", "chrome")
 # 连续翻页之间的间隔。linux.do 前面就是 Cloudflare，抓太快会直接吃 429。
 PAGE_DELAY = 1.5
+# 备用出口（如本机 wireproxy 的 socks5h://127.0.0.1:25344）。留空则永远直连。
+PROXY_URL = os.environ.get("LINUXDO_PROXY", "").strip()
+# 直连被 Cloudflare 拦/限流后，这段时间内所有请求都改走备用出口（秒）。
+# 实测：直连和备用出口是两条独立的限流桶，直连被罚时切过去立刻可用；
+# 但备用出口（WARP 共享 IP）本身额度很小，只适合应急，冷却到点必须回切直连。
+PROXY_COOLDOWN = 180
+_proxy_state = {"until": 0.0}
+
+
+def _egress_proxies():
+    """直连处于惩罚窗口内时返回备用出口配置，否则返回 None（走直连）。"""
+    if not PROXY_URL or time.monotonic() >= _proxy_state["until"]:
+        return None
+    return {"http": PROXY_URL, "https": PROXY_URL}
+
+
+def _fetch(path):
+    url = path if path.startswith("http") else BASE + path
+    headers = {"Accept": "application/json", "Cookie": _cookie_header()}
+    last = ""
+    for attempt in range(3):
+        proxies = _egress_proxies()
+        try:
+            r = creq.get(url, headers=headers, impersonate=IMPERSONATE, timeout=30,
+                         proxies=proxies)
+        except Exception as e:
+            last = f"请求失败：{e}"
+            time.sleep(0.8 * (attempt + 1))
+            continue
+        body = r.text
+        if _blocked(body) or r.status_code == 429:
+            if PROXY_URL and proxies is None:
+                # 直连被拦/限流：切备用出口，并在冷却期内都走它
+                _proxy_state["until"] = time.monotonic() + PROXY_COOLDOWN
+                last = f"直连被拦截(HTTP {r.status_code})，已切备用出口"
+                print(f"[egress] 直连被拦（HTTP {r.status_code}），切备用出口 {PROXY_URL}，"
+                      f"冷却 {PROXY_COOLDOWN}s", file=sys.stderr)
+                time.sleep(0.5)
+                continue
+            if _blocked(body):
+                last = f"被 Cloudflare 拦截(HTTP {r.status_code})"
+                time.sleep(0.8 * (attempt + 1))
+                continue
+            raise RuntimeError("被限流(429)：请降低频率，稍后重试。")
+        if r.status_code in (401, 403):
+            cookies.clear_cache()  # 失效即清缓存，下次用 env 重新 bootstrap；不重读浏览器
+            raise RuntimeError(
+                f"认证失败({r.status_code})：cookie 已失效，"
+                "请更新 LINUXDO_COOKIE（独立 _t）后重试。"
+            )
+        if r.status_code != 200 or not body.lstrip().startswith(("{", "[")):
+            raise RuntimeError(f"异常响应 HTTP {r.status_code}: {body[:200]}")
+        cookies.absorb_rotation(r)  # 接收轮换后的新 _t，自续期
+        return json.loads(body)
+    raise RuntimeError(f"{last}（已重试 3 次）。可设 LINUXDO_IMPERSONATE=chrome131 换指纹。")
 
 mcp = _Server("linuxdo")
 
@@ -61,37 +117,6 @@ def _cookie_header():
 
 def _blocked(body):
     return "Just a moment" in body[:600] or "challenge-platform" in body[:2000]
-
-
-def _fetch(path):
-    url = path if path.startswith("http") else BASE + path
-    headers = {"Accept": "application/json", "Cookie": _cookie_header()}
-    last = ""
-    for attempt in range(3):
-        try:
-            r = creq.get(url, headers=headers, impersonate=IMPERSONATE, timeout=30)
-        except Exception as e:
-            last = f"请求失败：{e}"
-            time.sleep(0.8 * (attempt + 1))
-            continue
-        body = r.text
-        if _blocked(body):
-            last = "被 Cloudflare 拦截"
-            time.sleep(0.8 * (attempt + 1))
-            continue
-        if r.status_code in (401, 403):
-            cookies.clear_cache()  # 失效即清缓存，下次用 env 重新 bootstrap；不重读浏览器
-            raise RuntimeError(
-                f"认证失败({r.status_code})：cookie 已失效，"
-                "请更新 LINUXDO_COOKIE（独立 _t）后重试。"
-            )
-        if r.status_code == 429:
-            raise RuntimeError("被限流(429)：请降低频率，稍后重试。")
-        if r.status_code != 200 or not body.lstrip().startswith(("{", "[")):
-            raise RuntimeError(f"异常响应 HTTP {r.status_code}: {body[:200]}")
-        cookies.absorb_rotation(r)  # 接收轮换后的新 _t，自续期
-        return json.loads(body)
-    raise RuntimeError(f"{last}（已重试 3 次）。可设 LINUXDO_IMPERSONATE=chrome131 换指纹。")
 
 
 def _strip_html(s):
