@@ -24,6 +24,8 @@ from . import cookies
 
 BASE = "https://linux.do"
 IMPERSONATE = os.environ.get("LINUXDO_IMPERSONATE", "chrome")
+# 连续翻页之间的间隔。linux.do 前面就是 Cloudflare，抓太快会直接吃 429。
+PAGE_DELAY = 1.5
 
 mcp = _Server("linuxdo")
 
@@ -172,36 +174,82 @@ def _whoami():
     return {k: u.get(k) for k in ("username", "name", "trust_level", "admin", "moderator")}
 
 
+def _category_name(category_id, cats=None):
+    """解析分类名：优先用本次响应里的 categories（有的站点会回填），
+    否则回退到 /site.json 的索引（linux.do 的 search.json 不回填 categories）。"""
+    if category_id is None:
+        return None
+    if cats and cats.get(category_id):
+        return cats[category_id]
+    return (_category_index().get(category_id) or {}).get("name")
+
+
 def _search(query, page, pages):
-    seen, results, last = set(), [], None
+    """连续抓取 pages 页（从 page 开始）。
+
+    续页判断不依赖 grouped_search_result.more_full_page_results——linux.do 只在
+    部分页回填该字段，末页常常没有。改为按「本页是否带来新话题」判断：
+    整页没有新话题即视为到底，停止继续抓。
+    后续某一页被限流/被 Cloudflare 拦时，已抓到的结果照常返回，并带 truncated 说明。
+    """
+    try:
+        page = max(1, int(page))
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        pages = max(1, int(pages))
+    except (TypeError, ValueError):
+        pages = 1
+
+    seen, results, term, last = set(), [], None, None
+    exhausted, truncated = False, None
     for i in range(pages):
         q = urllib.parse.quote(query)
-        last = _fetch(f"/search.json?q={q}&page={page + i}")
+        try:
+            last = _fetch(f"/search.json?q={q}&page={page + i}")
+        except RuntimeError as e:
+            # 第 1 页失败就直接抛；后续页失败则保留已有结果
+            if i == 0:
+                raise
+            truncated = str(e)
+            break
+        gsr = last.get("grouped_search_result") or {}
+        term = term or gsr.get("term")
         topics = {t["id"]: t for t in last.get("topics", [])}
-        cats = {c["id"]: c.get("name") for c in last.get("categories", [])}
+        cats = {c["id"]: c.get("name") for c in (last.get("categories") or []) if c.get("name")}
+        added = 0
         for p in last.get("posts", []):
             tid = p.get("topic_id")
             if tid in seen:
                 continue
             seen.add(tid)
+            added += 1
             t = topics.get(tid, {})
             results.append({
                 "topic_id": tid,
                 "title": t.get("title"),
-                "category": cats.get(t.get("category_id")),
+                "category": _category_name(t.get("category_id"), cats),
                 "tags": [tag.get("name") for tag in (t.get("tags") or [])],
                 "blurb": _strip_html(p.get("blurb")),
                 "posts_count": t.get("posts_count"),
                 "created_at": t.get("created_at"),
                 "url": _topic_url(t.get("slug"), tid),
             })
-        if not (last.get("grouped_search_result") or {}).get("more_full_page_results"):
+        if not last.get("posts") or added == 0:
+            exhausted = True
             break
         if i + 1 < pages:
-            time.sleep(0.6)
-    gsr = (last or {}).get("grouped_search_result") or {}
-    return {"term": gsr.get("term"), "count": len(results),
-            "more_results": gsr.get("more_full_page_results", False), "results": results}
+            time.sleep(PAGE_DELAY)
+
+    more = bool(last and last.get("posts")) and not exhausted
+    if more:
+        explicit = (last.get("grouped_search_result") or {}).get("more_full_page_results")
+        if explicit is False:
+            more = False
+    out = {"term": term, "count": len(results), "more_results": more, "results": results}
+    if truncated:
+        out["truncated"] = truncated
+    return out
 
 
 def _topic(topic_id, posts, start):
@@ -422,8 +470,9 @@ def whoami() -> dict:
 @_tool()
 def search(query: str, page: int = 1, pages: int = 1) -> dict:
     """全量搜索 linux.do。query 支持 Discourse 高级语法（order:latest、#分类、@用户、
-    tags:标签、after:2025-01-01、in:title 等）。pages 为连续抓取的页数（每页约 50 条）。
-    展示约定：Markdown 表格或列表，标题完整勿截断，纯文字勿用 emoji（易乱码）。"""
+    tags:标签、after:2025-01-01、in:title 等）。pages 为连续抓取的页数（每页约 50 条），
+    按「本页是否带来新话题」判断是否到底；后续页被限流时已抓到的结果照常返回并带
+    truncated 字段。展示约定：Markdown 表格或列表，标题完整勿截断，纯文字勿用 emoji（易乱码）。"""
     return _search(query, page, pages)
 
 
